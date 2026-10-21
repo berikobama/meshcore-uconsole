@@ -13,7 +13,11 @@ from meshcore_console.core.models import Channel, DeviceStatus, Message, Peer, R
 from meshcore_console.core.radio import rssi_to_signal_percent
 from meshcore_console.core.services import MeshcoreService
 from meshcore_console.core.types import MeshEventDict, SendResultDict
-from meshcore_console.meshcore.channel_db import ChannelDatabase
+from meshcore_console.meshcore.channel_db import (
+    ChannelDatabase,
+    normalize_channel_name,
+    normalize_channel_secret,
+)
 from meshcore_console.meshcore.region import normalize_region_scope
 from meshcore_console.meshcore.config import runtime_config_from_settings
 from meshcore_console.meshcore.db import open_db
@@ -260,6 +264,46 @@ class MeshcoreClient(MeshcoreService):
             # encrypt for them at send time and cannot match them at receive
             # time (issue #81).
             self._ensure_channel_secret(channel)
+        return channel
+
+    def import_channel(self, channel_id: str, display_name: str, secret: str) -> Channel:
+        """Create a private channel with an explicit PSK (issue #101).
+
+        Unlike ``ensure_channel``, which derives the deterministic hashtag
+        secret, this stores the caller-supplied key verbatim so the channel is
+        only readable by nodes holding the same secret. The secret is validated
+        and normalized (32 hex chars) before anything is written.
+        """
+        clean_secret = normalize_channel_secret(secret)
+        name = normalize_channel_name(display_name or channel_id)
+        if not name:
+            raise ValueError("Channel name is required")
+        if name == "public":
+            # The Public channel's shared secret is fixed by the MeshCore spec;
+            # overwriting it would silently split the network for this node.
+            raise ValueError("The Public channel secret cannot be replaced")
+        existing = self._channels.get(name)
+        if existing is not None and existing.kind == "dm":
+            # A private channel and a DM would share one conversation ID, and
+            # replies would silently follow the older channel's kind — a
+            # private reply could then broadcast to the group (or vice versa).
+            raise ValueError(
+                f"A direct message named '{name}' already exists; choose a different channel name"
+            )
+        # The secrets table's primary key is case-sensitive while lookups are
+        # not, so re-importing a channel stored under a different casing (e.g.
+        # 'Emergency' via the CLI) must update that row instead of inserting a
+        # second one the sender may never pick.
+        stored_name = self._channel_secrets.resolve_name(name) or name
+        self._channel_secrets.add_channel(stored_name, clean_secret)
+        channel = Channel(
+            channel_id=name,
+            display_name=f"#{name}",
+            unread_count=0,
+            kind="group",
+        )
+        self._channels[name] = channel
+        self._channel_store.add_or_update(channel)
         return channel
 
     def _ensure_channel_secret(self, channel: Channel) -> str:
