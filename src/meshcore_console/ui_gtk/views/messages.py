@@ -86,6 +86,18 @@ def dm_candidates(peers: list[Peer], query: str = "", self_key: str | None = Non
     )
 
 
+def sender_contact(message: Message, peers: list[Peer]) -> Peer | None:
+    """The contact who wrote ``message``, to answer it directly.
+
+    A channel message names its sender but carries no key, so this is the
+    contact of exactly that name: None until that sender's advert was heard."""
+    if message.is_outgoing:
+        return None
+    return next(
+        (p for p in peers if p.display_name == message.sender_id and not p.is_repeater), None
+    )
+
+
 class MessagesView(Gtk.Box):
     def __init__(self, service: MeshcoreService, event_store: UiEventStore, layout: Layout) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -557,12 +569,44 @@ class MessagesView(Gtk.Box):
         if not message.is_outgoing and message.rssi is not None:
             self._details_box.append(DetailRow("RSSI:", f"{message.rssi} dBm"))
 
-        # Close button
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_margin_top(8)
+        # Answer someone from a channel (or a room) directly.  Not in their
+        # own DM thread, nor for a sender the radio couldn't name.
+        sender = message.sender_id
+        if not message.is_outgoing and sender not in ("", "Unknown", self._dm_peer_name()):
+            peers = self._service.list_peers()
+            contact = sender_contact(message, peers)
+            if contact is not None:
+                dm_btn = Gtk.Button.new_with_label(f"Message {contact.display_name}")
+                dm_btn.connect("clicked", self._on_message_sender_clicked, contact.display_name)
+                actions.append(dm_btn)
+            elif not any(p.display_name == sender for p in peers):  # not a repeater either
+                hint = Gtk.Label(label=f"{sender} can't be messaged until their advert is heard")
+                hint.add_css_class("panel-muted")
+                hint.set_wrap(True)
+                hint.set_xalign(0)
+                actions.append(hint)
+
         close_btn = Gtk.Button.new_with_label("Close")
         close_btn.set_halign(Gtk.Align.END)
-        close_btn.set_margin_top(8)
+        close_btn.set_valign(Gtk.Align.CENTER)
+        close_btn.set_hexpand(True)
         close_btn.connect("clicked", self._on_close_details)
-        self._details_box.append(close_btn)
+        actions.append(close_btn)
+        self._details_box.append(actions)
+
+    def _dm_peer_name(self) -> str | None:
+        """The peer of the open thread if it is a DM (or room) thread."""
+        for channel in self._service.list_channels():
+            if channel.channel_id == self._selected_channel_id:
+                return channel.peer_name if channel.kind == "dm" else None
+        return None
+
+    def _on_message_sender_clicked(self, _button: Gtk.Button, peer_name: str) -> None:
+        logger.debug("UI: message sender clicked peer=%s", peer_name)
+        self.select_dm(peer_name)
+        self._focus_later(self._entry)
 
     def _on_mention_clicked(self, _label: Gtk.Label, uri: str) -> bool:
         """Handle clicks on @mention links — navigate to the peer."""

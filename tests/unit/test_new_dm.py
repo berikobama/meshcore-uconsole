@@ -45,3 +45,17 @@ def test_query_matches_the_start_of_the_public_key() -> None:
 def test_never_heard_contacts_come_last() -> None:
     quiet = peer("Quinn", "99" * 32)
     assert names(dm_candidates([quiet, ALICE], "")) == ["Alice", "Quinn"]
+
+
+def test_a_channel_message_is_answered_as_the_contact_of_that_name() -> None:
+    from meshcore_console.core.models import Message
+    from meshcore_console.ui_gtk.views.messages import sender_contact
+
+    def said(sender: str, **kw) -> Message:
+        return Message(message_id="m", sender_id=sender, body="hi", **kw)
+
+    assert sender_contact(said("Bob"), ALL) is BOB
+    assert sender_contact(said("bob"), ALL) is None  # the name is all there is: exact
+    assert sender_contact(said("Carol"), ALL) is None  # advert not heard yet
+    assert sender_contact(said("Hilltop"), ALL) is None  # a repeater takes no DMs
+    assert sender_contact(said("Bob", is_outgoing=True), ALL) is None
