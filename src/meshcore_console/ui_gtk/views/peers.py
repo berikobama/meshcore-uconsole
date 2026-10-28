@@ -79,6 +79,9 @@ class PeersView(Gtk.Box):
         self._contacts_list.add_css_class("peer-list")
         self._contacts_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self._contacts_list.connect("row-selected", self._on_peer_selected)
+        # A click shows the details; Enter or a double-click opens the DM.
+        self._contacts_list.set_activate_on_single_click(False)
+        self._contacts_list.connect("row-activated", self._on_contact_activated)
         contacts_scroll.set_child(self._contacts_list)
         contacts_column.append(contacts_scroll)
 
@@ -300,6 +303,9 @@ class PeersView(Gtk.Box):
         type_label.set_halign(Gtk.Align.START)
         self._details_content.append(type_label)
 
+        # The actions come first: below all the sections they were off screen.
+        self._details_content.append(self._build_actions(peer))
+
         # === Signal Section ===
         self._add_section_header("Signal")
 
@@ -379,13 +385,13 @@ class PeersView(Gtk.Box):
         if cached is not None:
             self._render_telemetry(cached)
 
-        # === Action buttons === (wrap rather than widen the window)
+    def _build_actions(self, peer: Peer) -> Gtk.FlowBox:
+        """The peer's action buttons (wrapping rather than widening the window)."""
         actions = Gtk.FlowBox()
         actions.set_selection_mode(Gtk.SelectionMode.NONE)
         actions.set_column_spacing(8)
         actions.set_row_spacing(8)
         actions.set_max_children_per_line(3)
-        actions.set_margin_top(16)
 
         fav_label = "☆ Favorite" if not peer.is_favorite else "★ Unfavorite"
         fav_btn = Gtk.Button.new_with_label(fav_label)
@@ -395,14 +401,14 @@ class PeersView(Gtk.Box):
         if not peer.is_repeater:
             message_btn = Gtk.Button.new_with_label("Send Message")
             message_btn.add_css_class("suggested-action")
+            message_btn.set_tooltip_text("Enter or a double-click on the contact does this too")
             message_btn.connect("clicked", self._on_send_message_clicked, peer)
             actions.append(message_btn)
 
         telem_btn = Gtk.Button.new_with_label("Request Telemetry")
         telem_btn.connect("clicked", self._on_request_telemetry_clicked, peer)
         actions.append(telem_btn)
-
-        self._details_content.append(actions)
+        return actions
 
     def _add_section_header(self, title: str) -> None:
         """Add a section header to the details panel."""
@@ -448,10 +454,15 @@ class PeersView(Gtk.Box):
         self._service.set_favorite(peer.peer_id, not peer.is_favorite)
         GLib.idle_add(self._refresh_peers)
 
-    def _on_send_message_clicked(self, _button: Gtk.Button, peer: Peer) -> None:
+    def _on_send_message_clicked(self, _button: Gtk.Button | None, peer: Peer) -> None:
         """Navigate to messages view and start a conversation with this peer."""
         logger.debug("UI: send message to peer=%s", peer.display_name)
         navigate(self, "messages", ("select_dm", peer.display_name))
+
+    def _on_contact_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        peer = getattr(row, "peer", None)
+        if peer is not None:
+            self._on_send_message_clicked(None, peer)
 
     def _on_request_telemetry_clicked(self, button: Gtk.Button, peer: Peer) -> None:
         """Request telemetry from a peer in a background thread."""
@@ -460,7 +471,7 @@ class PeersView(Gtk.Box):
         button.set_sensitive(False)
         button.set_label("Requesting...")
 
-        # Add a spinner below the actions
+        # A spinner at the end, where the result will appear
         spinner_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         spinner_box.set_halign(Gtk.Align.START)
         spinner = Gtk.Spinner()
@@ -470,6 +481,7 @@ class PeersView(Gtk.Box):
         spinner_label.add_css_class("panel-muted")
         spinner_box.append(spinner_label)
         self._details_content.append(spinner_box)
+        self._scroll_details_to_bottom()
 
         def _do_request() -> None:
             try:
