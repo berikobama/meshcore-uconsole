@@ -19,6 +19,16 @@ from meshcore_console.ui_gtk.widgets.node_badge import (
 )
 
 
+def seen_text(peer: Peer) -> str:
+    """When ``peer``'s last advert was heard: "seen 14:05", with the date if not today."""
+    if not peer.last_advert_time:
+        return "not seen"
+    local_dt = to_local(peer.last_advert_time)
+    if local_dt.date() == date.today():
+        return f"seen {local_dt.strftime('%H:%M')}"
+    return f"seen {local_dt.strftime('%b %-d, %H:%M')}"
+
+
 class PeerListRow(Gtk.ListBoxRow):
     """A row in the contacts or repeaters list.
 
@@ -72,16 +82,7 @@ class PeerListRow(Gtk.ListBoxRow):
         name.set_max_width_chars(20)
         text_box.append(name)
 
-        # Show last seen time (with date if not today)
-        if peer.last_advert_time:
-            local_dt = to_local(peer.last_advert_time)
-            if local_dt.date() == date.today():
-                meta_text = f"seen {local_dt.strftime('%H:%M')}"
-            else:
-                meta_text = f"seen {local_dt.strftime('%b %-d, %H:%M')}"
-        else:
-            meta_text = "not seen"
-        meta = Gtk.Label(label=meta_text)
+        meta = Gtk.Label(label=seen_text(peer))
         meta.add_css_class("panel-muted")
         meta.add_css_class("peer-meta")
         meta.set_halign(Gtk.Align.START)

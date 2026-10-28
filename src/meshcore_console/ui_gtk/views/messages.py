@@ -10,7 +10,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gdk, GLib, Gtk, Pango
 
-from meshcore_console.core.models import Channel, Message
+from meshcore_console.core.models import Channel, Message, Peer
 from meshcore_console.core.radio import snr_to_quality
 from meshcore_console.core.services import MeshcoreService
 from meshcore_console.ui_gtk.compat import (
@@ -30,6 +30,7 @@ from meshcore_console.ui_gtk.widgets import (
     PathVisualization,
 )
 from meshcore_console.ui_gtk.widgets.mention import parse_mentions
+from meshcore_console.ui_gtk.widgets.peer_list_row import seen_text
 from meshcore_console.ui_gtk.widgets.node_badge import STYLE_DEFAULT, STYLE_SELF, find_peer_for_hop
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,32 @@ def messages_after(messages: list[Message], last_id: str | None) -> list[Message
         if message.message_id == last_id:
             return messages[index + 1 :]
     return None
+
+
+def dm_candidates(peers: list[Peer], query: str = "", self_key: str | None = None) -> list[Peer]:
+    """The contacts a new DM can go to, matching ``query`` (part of the name or
+    the start of the public key), best first: names starting with the query,
+    then favourites, then the most recently heard.
+
+    Only nodes whose advert was heard are peers at all: a DM is encrypted to
+    the recipient's public key, and only an advert carries it.  Repeaters take
+    no messages, and this device is not a recipient."""
+    q = query.strip().casefold()
+
+    def heard(peer: Peer) -> float:
+        return peer.last_advert_time.timestamp() if peer.last_advert_time else 0.0
+
+    matches = [
+        p
+        for p in peers
+        if not p.is_repeater
+        and not (self_key and p.public_key == self_key)
+        and (q in p.display_name.casefold() or (p.public_key or "").casefold().startswith(q))
+    ]
+    return sorted(
+        matches,
+        key=lambda p: (not p.display_name.casefold().startswith(q), not p.is_favorite, -heard(p)),
+    )
 
 
 class MessagesView(Gtk.Box):
@@ -96,12 +123,22 @@ class MessagesView(Gtk.Box):
         channel_scroll.set_child(self._channel_list)
         channel_panel.append(channel_scroll)
 
+        # A DM could only be started from a contact's details in Peers (or
+        # the Map): starting one belongs where the conversations are.
+        new_dm_btn = Gtk.Button.new()
+        new_dm_btn.set_child(Gtk.Label(label="+ New Message"))
+        new_dm_btn.add_css_class("flat")
+        new_dm_btn.set_margin_start(4)
+        new_dm_btn.set_margin_end(4)
+        new_dm_btn.set_margin_top(4)
+        new_dm_btn.connect("clicked", self._on_new_dm_clicked)
+        channel_panel.append(new_dm_btn)
+
         add_channel_btn = Gtk.Button.new()
         add_channel_btn.set_child(Gtk.Label(label="+ Add Channel"))
         add_channel_btn.add_css_class("flat")
         add_channel_btn.set_margin_start(4)
         add_channel_btn.set_margin_end(4)
-        add_channel_btn.set_margin_top(4)
         add_channel_btn.set_margin_bottom(4)
         add_channel_btn.connect("clicked", self._on_add_channel_clicked)
         channel_panel.append(add_channel_btn)
@@ -790,6 +827,135 @@ class MessagesView(Gtk.Box):
             error.set_close_response("ok")
             present_dialog(error, self.get_root())
 
+    def _on_new_dm_clicked(self, _button: Gtk.Button) -> None:
+        """Pick a contact by typing part of its name, and open the DM thread."""
+        logger.debug("UI: new message clicked")
+        dialog = build_alert_dialog(
+            self.get_root(),
+            "New Message",
+            "Contacts appear here once their advert has been heard: a direct "
+            "message needs the recipient's public key, and only an advert carries it.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("open", "Open")
+        dialog.set_response_appearance("open", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("open")
+        dialog.set_close_response("cancel")
+
+        entry = Gtk.Entry.new()
+        entry.set_placeholder_text("Name or key")
+        entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "system-search-symbolic")
+        entry.set_margin_start(12)
+        entry.set_margin_end(12)
+        entry.set_margin_top(8)
+
+        results = Gtk.ListBox.new()
+        results.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        placeholder = Gtk.Label(label="")
+        placeholder.add_css_class("panel-muted")
+        placeholder.set_wrap(True)
+        placeholder.set_margin_top(12)
+        results.set_placeholder(placeholder)
+        results.connect("row-activated", self._on_dm_candidate_activated, dialog)
+
+        scroll = Gtk.ScrolledWindow.new()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(200)
+        scroll.set_margin_start(12)
+        scroll.set_margin_end(12)
+        scroll.set_margin_bottom(8)
+        scroll.set_child(results)
+
+        # The arrow keys move through the list while typing goes on in the entry.
+        keys = Gtk.EventControllerKey.new()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_dm_search_key, results, scroll)
+        entry.add_controller(keys)
+        entry.connect("changed", self._fill_dm_candidates, results, placeholder, dialog)
+        entry.connect("activate", self._on_dm_search_activate, results, dialog)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.append(entry)
+        box.append(scroll)
+        dialog.set_extra_child(box)
+        dialog.connect("response", self._on_new_dm_response, results)
+        self._fill_dm_candidates(entry, results, placeholder, dialog)
+        present_dialog(dialog, self.get_root())
+        entry.grab_focus()
+
+    def _fill_dm_candidates(
+        self,
+        entry: Gtk.Entry,
+        results: Gtk.ListBox,
+        placeholder: Gtk.Label,
+        dialog: Adw.AlertDialog,
+    ) -> None:
+        clear_listbox(results)
+        peers = self._service.list_peers()
+        candidates = dm_candidates(peers, entry.get_text(), self._service.get_self_public_key())
+        for peer in candidates:
+            results.append(_dm_candidate_row(peer))
+        if entry.get_text().strip():
+            placeholder.set_text("No contact matches")
+        else:
+            placeholder.set_text("No contacts heard yet")
+        first = results.get_row_at_index(0)
+        if first is not None:
+            results.select_row(first)
+        dialog.set_response_enabled("open", first is not None)
+
+    def _on_dm_search_key(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+        results: Gtk.ListBox,
+        scroll: Gtk.ScrolledWindow,
+    ) -> bool:
+        if keyval not in (Gdk.KEY_Up, Gdk.KEY_Down):
+            return False
+        row = results.get_selected_row()
+        index = row.get_index() if row is not None else -1
+        index += 1 if keyval == Gdk.KEY_Down else -1
+        target = results.get_row_at_index(max(index, 0))
+        if target is not None:
+            results.select_row(target)
+            ok, bounds = target.compute_bounds(results)
+            if ok:  # keep it in view (focus stays in the entry, which would not scroll)
+                adj = scroll.get_vadjustment()
+                top, bottom = bounds.get_y(), bounds.get_y() + bounds.get_height()
+                if top < adj.get_value():
+                    adj.set_value(top)
+                elif bottom > adj.get_value() + adj.get_page_size():
+                    adj.set_value(bottom - adj.get_page_size())
+        return True
+
+    def _on_dm_search_activate(
+        self, _entry: Gtk.Entry, results: Gtk.ListBox, dialog: Adw.AlertDialog
+    ) -> None:
+        if results.get_selected_row() is not None:
+            activate_dialog_response(dialog, "open")
+
+    def _on_dm_candidate_activated(
+        self, results: Gtk.ListBox, row: Gtk.ListBoxRow, dialog: Adw.AlertDialog
+    ) -> None:
+        results.select_row(row)
+        activate_dialog_response(dialog, "open")
+
+    def _on_new_dm_response(
+        self, _dialog: Adw.AlertDialog, response: str, results: Gtk.ListBox
+    ) -> None:
+        peer = getattr(results.get_selected_row(), "peer", None)
+        if response != "open" or peer is None:
+            return
+        logger.debug("UI: new message to peer=%s", peer.display_name)
+        self.select_dm(peer.display_name)
+        self._focus_later(self._entry)  # once the dialog has handed focus back
+
+    def _focus_later(self, widget: Gtk.Widget) -> None:
+        GLib.idle_add(lambda: widget.grab_focus() and False)
+
     def _on_add_channel_clicked(self, _button: Gtk.Button) -> None:
         """Show a dialog to add a hashtag channel by name, optionally with a
         private secret key (issue #101)."""
@@ -944,3 +1110,28 @@ class MessagesView(Gtk.Box):
         self._reload_messages()
         self._service.mark_channel_read(channel.channel_id)
         self._update_channel_unread_display(channel.channel_id, 0)
+
+
+def _dm_candidate_row(peer: Peer) -> Gtk.ListBoxRow:
+    """A contact in the New Message list: name, key prefix and when last heard
+    (the key tells apart contacts with the same name)."""
+    row = Gtk.ListBoxRow.new()
+    setattr(row, "peer", peer)
+    row.update_property([Gtk.AccessibleProperty.LABEL], [peer.display_name])
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    body.set_margin_top(6)
+    body.set_margin_bottom(6)
+    body.set_margin_start(8)
+    body.set_margin_end(8)
+    name = Gtk.Label(label=("\u2605 " if peer.is_favorite else "") + peer.display_name)
+    name.set_halign(Gtk.Align.START)
+    name.set_ellipsize(Pango.EllipsizeMode.END)
+    body.append(name)
+    key = (peer.public_key or "")[:8]
+    meta = Gtk.Label(label=f"{key} \u00b7 {seen_text(peer)}" if key else seen_text(peer))
+    meta.add_css_class("panel-muted")
+    meta.add_css_class("peer-meta")
+    meta.set_halign(Gtk.Align.START)
+    body.append(meta)
+    row.set_child(body)
+    return row
